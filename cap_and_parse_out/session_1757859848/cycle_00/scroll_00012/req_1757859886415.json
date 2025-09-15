@@ -1,0 +1,24 @@
+{
+  "method": "POST",
+  "url": "https://www.facebook.com/api/graphql/",
+  "headers": {
+    "sec-ch-ua-full-version-list": "\"Not=A?Brand\";v=\"24.0.0.0\", \"Chromium\";v=\"140.0.7339.16\"",
+    "sec-ch-ua-platform": "\"Windows\"",
+    "referer": "https://www.facebook.com/profile/100069113923869/search/?q=walang%20pasok",
+    "sec-ch-ua": "\"Not=A?Brand\";v=\"24\", \"Chromium\";v=\"140\"",
+    "x-fb-friendly-name": "CometMessagingJewelDropdownEBUpsellContainerQuery",
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-model": "\"\"",
+    "x-asbd-id": "359341",
+    "x-fb-lsd": "cvnDF18gxdahk7D6qg3dED",
+    "sec-ch-prefers-color-scheme": "light",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+    "content-type": "application/x-www-form-urlencoded",
+    "sec-ch-ua-platform-version": "\"19.0.0\""
+  },
+  "resource_type": "xhr",
+  "doc_id": null,
+  "friendly_name": "CometMessagingJewelDropdownEBUpsellContainerQuery",
+  "variables": null,
+  "raw_post_data": null
+}

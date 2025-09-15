@@ -1,0 +1,14 @@
+{
+  "data": {
+    "viewer": {
+      "call_blocked_until": 0
+    }
+  },
+  "extensions": {
+    "server_metadata": {
+      "request_start_time_ms": 1757859182979,
+      "time_at_flush_ms": 1757859183003
+    },
+    "is_final": true
+  }
+}

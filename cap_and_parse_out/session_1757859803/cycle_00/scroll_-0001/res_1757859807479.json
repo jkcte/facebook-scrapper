@@ -1,0 +1,15 @@
+{
+  "data": {
+    "user": {
+      "message_capabilities2_str": "69888",
+      "id": "100041217482004"
+    }
+  },
+  "extensions": {
+    "server_metadata": {
+      "request_start_time_ms": 1757859808807,
+      "time_at_flush_ms": 1757859808840
+    },
+    "is_final": true
+  }
+}

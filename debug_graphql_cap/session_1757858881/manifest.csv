@@ -1,0 +1,2 @@
+cycle,scroll_idx,ts_iso,req_method,req_res_type,status,content_type,url,doc_id,friendly_name,req_json_path,res_body_path,req_size,res_size,req_hash
+0,-1,2025-09-14T14:08:03.103849+00:00,POST,xhr,200,"text/html; charset=""utf-8""",https://www.facebook.com/api/graphql/,,,cycle_00\scroll_-01\req_1757858883103.json,cycle_00\scroll_-01\res_1757858883103.bin,0,204,7836b1476aad513afa54cf89d385dcb1efc85f2e
