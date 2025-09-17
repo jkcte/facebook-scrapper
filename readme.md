@@ -342,7 +342,3 @@ A: Those are **route** rows. Route bundles rarely carry those fields.
 
 **Q: Will it work if I’m not logged in?**
 A: You’ll only see public content. The HAR reflects whatever your session can fetch.
-
----
-
-If you want me to ship this README as a `README.md` file in your repo layout, say the word and where to place it (root vs. `docs/`).
