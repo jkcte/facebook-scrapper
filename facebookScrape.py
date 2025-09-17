@@ -1,418 +1,266 @@
-# fb_capture_and_parse.py
-# pip install playwright
-# playwright install
+#!/usr/bin/env python3
+# facebookScrape.py — capture FB network using your real Chrome/Edge/Opera GX profile
+from __future__ import annotations
 
-import csv, json, time, hashlib, re
+import argparse, csv, json, os, re, sys, time
+from datetime import datetime
 from pathlib import Path
-from datetime import datetime, timezone
-from urllib.parse import parse_qs
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-# =======================
-# ULTRA-AGGRESSIVE KNOBS
-# =======================
-SEARCH_URL = "https://www.facebook.com/profile/100069113923869/search/?q=walang%20pasok"
+IS_WINDOWS = (os.name == "nt")
+GRAPHQL_RE = re.compile(r"https://www\.facebook\.com/api/graphql/", re.I)
+ROUTE_RE   = re.compile(r"/ajax/bulk-route-definitions", re.I)
 
-HEADLESS                = False
-INITIAL_BUFFER_SEC      = 4    # minimal as possible before starting scrolls
-PER_SCROLL_WAIT_SEC     = 2   # tiny pause after each scroll
-QUIET_SEC_AFTER_SCROLL  = 2   # wait until no new graphql for this long
-FINAL_IDLE_SEC          = 5   # short cooldown at the end
-MAX_SCROLLS             = 10_000 # per your ask
+def _expand(p: str) -> str:
+    return os.path.expandvars(os.path.expanduser(p))
 
-RELOAD_CYCLES           = 1      # keep 1 unless you explicitly want reloads
-WAIT_BETWEEN_RELOADS_SEC= 0.0
-
-# Keep only posts that match this keyword (case-insensitive). Set to None to keep all.
-FILTER_KEYWORD = "walang pasok"
-
-# Storage
-OUT_ROOT     = Path("cap_and_parse_out")
-COOKIES_PATH = Path("fb_cookies.json")
-
-FB_GRAPHQL_MATCH = ("/api/graphql", "/api/graphqlbatch")
-FB_HOST_HINTS    = (".facebook.com",)
-
-TAB_LABELS = [
-    r"^Posts$", r"^Mga Post$", r"^Public Posts$", r"^Mga Pampublikong Post$"
-]
-
-# =======================
-# Helpers
-# =======================
-def ts_iso(ts=None): return datetime.fromtimestamp(ts or time.time(), tz=timezone.utc).isoformat()
-def ensure_dir(p: Path): p.mkdir(parents=True, exist_ok=True)
-
-def save_cookies(ctx): COOKIES_PATH.write_text(json.dumps(ctx.cookies(), ensure_ascii=False, indent=2), encoding="utf-8")
-def load_cookies(ctx):
-    if COOKIES_PATH.exists():
-        ctx.add_cookies(json.loads(COOKIES_PATH.read_text(encoding="utf-8"))); return True
-    return False
-
-def is_fb_graphql(url: str) -> bool:
-    return any(h in url for h in FB_HOST_HINTS) and any(s in url for s in FB_GRAPHQL_MATCH)
-
-def short_sha1(b: bytes) -> str:
-    return hashlib.sha1(b).hexdigest()[:12]
-
-def parse_graphql_request(req):
-    info = {
-        "method": req.method,
-        "url": req.url,
-        "headers": dict(req.headers),
-        "resource_type": req.resource_type,
-        "doc_id": None,
-        "friendly_name": None,
-        "variables": None,
-        "raw_post_data": None,
-    }
-    # friendlier name often in header
-    fn = info["headers"].get("x-fb-friendly-name") or info["headers"].get("x-fb-friendly-name".lower())
-    if fn: info["friendly_name"] = fn
+def detect_default_browser_windows() -> str | None:
+    if not IS_WINDOWS: return None
     try:
-        pd = req.post_data() or ""
-        info["raw_post_data"] = pd
-        if pd:
-            form = parse_qs(pd)
-            info["doc_id"] = form.get("doc_id", [None])[0]
-            friendly = form.get("fb_api_req_friendly_name", [None])[0]
-            info["friendly_name"] = info["friendly_name"] or friendly
-            variables = form.get("variables", [None])[0]
-            if variables:
-                try: info["variables"] = json.loads(variables)
-                except Exception: info["variables"] = variables
+        import winreg  # type: ignore
+        key = r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
+            progid, _ = winreg.QueryValueEx(k, "ProgId")
+            progid = (progid or "").lower()
+            if "edge" in progid or "appx" in progid: return "edge"
+            if "chrome" in progid: return "chrome"
     except Exception:
         pass
-    return info
+    return None
 
-def try_parse_json(body: bytes):
-    if not body: return None
-    s = body.decode("utf-8", errors="replace").lstrip()
-    if s.startswith("for (;;);"): s = s[10:].lstrip()
-    try: return json.loads(s)
-    except Exception: return None
+def default_profile_root(browser: str) -> Path | None:
+    if not IS_WINDOWS: return None
+    local = os.environ.get("LOCALAPPDATA"); roaming = os.environ.get("APPDATA")
+    if browser == "chrome" and local:
+        p = Path(local)/"Google"/"Chrome"/"User Data"; return p if p.exists() else None
+    if browser == "edge" and local:
+        p = Path(local)/"Microsoft"/"Edge"/"User Data"; return p if p.exists() else None
+    if browser == "opera" and roaming:
+        # Opera GX keeps profile in Roaming
+        p = Path(roaming)/"Opera Software"/"Opera GX Stable"; return p if p.exists() else None
+    return None
 
-def click_posts_tab(page):
-    for pat in TAB_LABELS:
-        try:
-            page.get_by_role("link", name=re.compile(pat, re.I)).first.click(timeout=800)
-            return True
-        except Exception: pass
-        try:
-            page.get_by_role("tab", name=re.compile(pat, re.I)).first.click(timeout=800)
-            return True
-        except Exception: pass
-    return False
+def detect_opera_exe_windows() -> Path | None:
+    # Most common
+    cand = Path(os.environ.get("LOCALAPPDATA",""))/"Programs"/"Opera GX"/"opera.exe"
+    if cand.exists(): return cand
+    cand = cand.with_name("launcher.exe")
+    if cand.exists(): return cand
+    # Try standard Opera (non-GX) as a fallback
+    cand2 = Path(os.environ.get("LOCALAPPDATA",""))/"Programs"/"Opera"/"opera.exe"
+    if cand2.exists(): return cand2
+    return None
 
-# ====== Parsing utilities for serpResponse edges ======
-try:
-    from zoneinfo import ZoneInfo
-    PH_TZ = ZoneInfo("Asia/Manila")
-except Exception:
-    PH_TZ = None
+def now_ms() -> int: return int(time.time()*1000)
+def ensure_dir(p: Path) -> Path: p.mkdir(parents=True, exist_ok=True); return p
 
-def to_utc_iso(ts):
-    if ts is None: return ""
-    try: return datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
-    except Exception: return ""
-
-def to_manila_iso(ts):
-    if ts is None: return ""
-    try:
-        dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
-        if PH_TZ: dt = dt.astimezone(PH_TZ)
-        return dt.isoformat()
-    except Exception:
-        return ""
-
-def strings_from(obj):
-    out = []
-    if isinstance(obj, dict):
-        for v in obj.values(): out.extend(strings_from(v))
-    elif isinstance(obj, list):
-        for it in obj: out.extend(strings_from(it))
-    elif isinstance(obj, str):
-        out.append(obj)
-    return out
-
-_PERM_RE = re.compile(r"https?://(?:www|m|mbasic)\.facebook\.com/[^ \"]+?(?:story\.php|permalink\.php)[^ \"]*", re.I)
-def guess_permalink(story_node):
-    if isinstance(story_node, dict):
-        for key in ("permalink_url","url","permalink"):
-            val = story_node.get(key)
-            if isinstance(val, str) and "facebook.com" in val: return val
-    for s in strings_from(story_node):
-        m = _PERM_RE.search(s)
-        if m: return m.group(0)
-    return ""
-
-def get_story_text_and_node(edge):
-    # New path (Opera GX capture)
-    try:
-        story = (
-            edge["rendering_strategy"]["view_model"]["click_model"]["story"]
-            ["comet_sections"]["content"]["story"]
-        )
-        return story["message"]["text"], story
-    except Exception:
-        # Rare fallback
-        try:
-            story = (
-                edge["view_model"]["click_model"]["story"]
-                ["comet_sections"]["content"]["story"]
-            )
-            return story["message"]["text"], story
-        except Exception:
-            return None, None
-
-def find_creation_time(edge, story_node):
-    # 1) context_layout → metadata[*] → story.creation_time
-    try:
-        meta = (
-            edge["rendering_strategy"]["view_model"]["click_model"]["story"]
-            ["comet_sections"]["context_layout"]["story"]["comet_sections"]["metadata"]
-        )
-        metas = meta if isinstance(meta, list) else [meta]
-        for m in metas:
-            st = m.get("story")
-            if isinstance(st, dict) and isinstance(st.get("creation_time"), int):
-                return st["creation_time"]
-    except Exception:
-        pass
-    # 2) directly on content story
-    if isinstance(story_node, dict) and isinstance(story_node.get("creation_time"), int):
-        return story_node["creation_time"]
-    # 3) first plausible epoch anywhere in the edge
-    lo, hi = 1_420_000_000, 2_080_000_000  # ~2015..2035
-    def scan(obj):
-        if isinstance(obj, dict):
-            for v in obj.values():
-                ts = scan(v)
-                if ts is not None: return ts
-        elif isinstance(obj, list):
-            for it in obj:
-                ts = scan(it)
-                if ts is not None: return ts
-        elif isinstance(obj, int) and lo <= obj <= hi:
-            return obj
-        return None
-    return scan(edge)
-
-def extract_from_serp_json(parsed_json):
-    payloads = parsed_json if isinstance(parsed_json, list) else [parsed_json]
-    for pl in payloads:
-        try:
-            edges = pl["data"]["serpResponse"]["results"]["edges"]
-        except Exception:
-            continue
-        if not isinstance(edges, list): continue
-        for e in edges:
-            text, story_node = get_story_text_and_node(e)
-            if not text or not story_node: continue
-            ts = find_creation_time(e, story_node)
-            permalink = guess_permalink(story_node)
-            yield {"text": text.strip(), "ts": ts, "permalink": permalink}
-
-# =======================
-# Main
-# =======================
 def main():
-    session_dir = OUT_ROOT / f"session_{int(time.time())}"
-    ensure_dir(session_dir)
+    ap = argparse.ArgumentParser(description="Capture FB GraphQL/Route + HAR, using your real browser profile.")
+    ap.add_argument("--link", required=True, help="Facebook URL to open.")
+    # Timing
+    ap.add_argument("--scrolls", type=int, default=20)
+    ap.add_argument("--initial-buffer-s", type=float, default=10.0)
+    ap.add_argument("--per-scroll-s", type=float, default=5.0)
+    ap.add_argument("--nav-timeout-s", type=float, default=60.0)
+    # Browser & profile
+    ap.add_argument("--browser", choices=["auto","chrome","edge","opera"], default="auto")
+    ap.add_argument("--profile-root", type=str, default=None,
+                    help="User-data dir (Chrome/Edge User Data OR Opera GX Stable).")
+    ap.add_argument("--profile-name", type=str, default="Default",
+                    help="Profile directory name inside user-data dir (e.g., 'Default', 'Profile 1').")
+    ap.add_argument("--opera-exe", type=str, default=None,
+                    help="Path to Opera GX executable (opera.exe or launcher.exe).")
+    # Other
+    ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--session-root", default="debug_graphql_cap")
+    ap.add_argument("--har-filename", default="network.har")
+    ap.add_argument("--no-har", action="store_true")
+    args = ap.parse_args()
 
-    manifest_csv = session_dir / "manifest.csv"
-    mf = manifest_csv.open("w", newline="", encoding="utf-8")
-    mw = csv.writer(mf)
-    mw.writerow([
-        "cycle","scroll_idx","ts_iso",
-        "req_method","req_res_type","status","content_type",
-        "url","friendly_name","doc_id",
-        "is_json","has_serp","json_hash",
-        "req_json_path","res_body_path","res_json_path",
-        "req_size","res_size"
-    ])
+    # Resolve browser
+    b = args.browser
+    if b == "auto":
+        b = detect_default_browser_windows() or "chrome"
+    if b not in ("chrome","edge","opera"):
+        print("[ERR] Unsupported browser (chrome/edge/opera)."); sys.exit(1)
+
+    # Resolve profile root
+    user_data_root = Path(_expand(args.profile_root)) if args.profile_root else default_profile_root(b)
+    if not user_data_root or not user_data_root.exists():
+        print(f"[ERR] Could not locate user-data root for {b}.")
+        if IS_WINDOWS:
+            if b=="chrome":
+                print('     Try: --profile-root "%LOCALAPPDATA%\\Google\\Chrome\\User Data"')
+            elif b=="edge":
+                print('     Try: --profile-root "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data"')
+            else:
+                print('     Try: --profile-root "%APPDATA%\\Opera Software\\Opera GX Stable"')
+        sys.exit(1)
+
+    # Resolve Opera executable if needed
+    opera_exe = None
+    if b == "opera":
+        opera_exe = Path(_expand(args.opera_exe)).resolve() if args.opera_exe else detect_opera_exe_windows()
+        if not opera_exe or not opera_exe.exists():
+            print("[ERR] Opera GX executable not found. Pass --opera-exe \"C:\\Users\\YOU\\AppData\\Local\\Programs\\Opera GX\\opera.exe\""); sys.exit(1)
+
+    print(f"[!] Close your {b.capitalize()} completely before running (profile lock).")
+    print(f"[i] Profile root: {user_data_root}")
+    print(f"[i] Profile name: {args.profile_name}")
+    if b=="opera": print(f"[i] Opera exe:   {opera_exe}")
+
+    # Session filesystem
+    ts = now_ms()
+    session_dir = ensure_dir(Path(args.session_root)/f"session_{ts}")
+    cycle_dir   = ensure_dir(session_dir/"cycle_00")
+    manifest_fp = session_dir/"manifest.csv"
+    har_path    = session_dir/args.har_filename
+    print(f"[i] Session dir: {session_dir.resolve()}")
+    print(f"[i] HAR: {'disabled' if args.no_har else har_path.resolve()}")
+
+    with manifest_fp.open("w", newline="", encoding="utf-8-sig") as f:
+        csv.writer(f).writerow([
+            "when_iso","cycle","scroll_idx","status","size_bytes","friendly_name","doc_id",
+            "is_json","is_serp","kind","file_path","url"
+        ])
+
+    graphql_seen=route_seen=graphql_saved=route_saved=non_json=0
+    def write_manifest(row):
+        with manifest_fp.open("a", newline="", encoding="utf-8-sig") as f:
+            csv.writer(f).writerow(row)
+
+    def save_blob(prefix, scroll_idx, url, status, body_bytes, friendly, doc_id, is_json, is_serp, kind):
+        nonlocal graphql_saved, route_saved, non_json
+        ofn = f"{prefix}_{now_ms()}.{'json' if is_json else 'bin'}"
+        out_path = cycle_dir / ofn
+        out_path.write_bytes(body_bytes)
+        if is_json:
+            print(f"[✓] Saved {kind} • scr {scroll_idx} • {status} • {len(body_bytes)}B • fn={friendly or 'None'} • json=True • serp={is_serp}")
+        else:
+            non_json += 1
+            print(f"[non-json] {kind} {status} • {url}")
+        if kind=="GraphQL": graphql_saved+=1
+        else: route_saved+=1
+        write_manifest([datetime.now().isoformat(timespec="seconds"),0,scroll_idx,status,len(body_bytes),
+                        friendly or "", doc_id or "", 1 if is_json else 0, 1 if is_serp else 0, kind, str(out_path), url])
+
+    def get_req_meta(resp):
+        req = resp.request
+        friendly = ""
+        try:
+            friendly = req.headers.get("x-fb-friendly-name") or req.headers.get("X-FB-Friendly-Name") or ""
+        except Exception: pass
+        doc_id = ""
+        try:
+            if req.method.upper()=="POST" and req.post_data:
+                for part in (req.post_data or "").split("&"):
+                    if part.startswith("doc_id="): doc_id = part.split("=",1)[1]
+                    elif not friendly and part.startswith("fb_api_req_friendly_name="):
+                        friendly = part.split("=",1)[1]
+        except Exception: pass
+        return friendly, doc_id
+
+    def is_search_serp(name: str) -> bool:
+        return bool(name and "SearchCometResultsPaginatedResultsQuery" in name)
+
+    nav_timeout_ms = int(args.nav_timeout_s * 1000)
+    current_scroll_idx = -1
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS)
-        ctx = browser.new_context()
-        page = ctx.new_page()
+        # Build persistent context params
+        common_kwargs = dict(
+            user_data_dir=str(user_data_root),
+            headless=args.headless,
+            args=[f"--profile-directory={args.profile_name}"],
+        )
+        if not args.no_har:
+            common_kwargs.update(record_har_path=str(har_path), record_har_mode="full")
 
-        if not load_cookies(ctx):
-            page.goto("https://www.facebook.com/login.php", wait_until="domcontentloaded")
-            print("Log in, then press Enter here…"); input(); save_cookies(ctx)
+        if b in ("chrome","edge"):
+            channel = "chrome" if b=="chrome" else "msedge"
+            context = p.chromium.launch_persistent_context(channel=channel, **common_kwargs)
+        else:  # opera
+            # Use Opera executable directly
+            context = p.chromium.launch_persistent_context(executable_path=str(opera_exe), **common_kwargs)
 
-        last_graphql_at = 0.0
+        try:
+            context.grant_permissions(["notifications"], origin="https://www.facebook.com")
+        except Exception: pass
 
-        def save_event(req, resp, cycle, scroll_idx):
-            nonlocal last_graphql_at
-            url = req.url
-            if not is_fb_graphql(url): return
-            ts = time.time(); last_graphql_at = ts
-            info = parse_graphql_request(req)
+        page = context.pages[0] if context.pages else context.new_page()
 
-            # files
-            cycle_dir = session_dir / f"cycle_{cycle:02d}"
-            scroll_dir = cycle_dir / f"scroll_{scroll_idx:05d}"  # 10k safe width
-            ensure_dir(scroll_dir)
-            base = f"{int(ts*1000)}"
-
-            # request meta
-            req_path = scroll_dir / f"req_{base}.json"
-            req_path.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
-            req_size = len(info.get("raw_post_data") or "")
-
-            # response raw
-            status = None; ctype = ""; body = b""
+        def on_response(resp):
+            nonlocal graphql_seen, route_seen
+            url = resp.url or ""
             try:
-                status = resp.status
-                ctype = resp.headers.get("content-type", "")
-                body = resp.body() or b""
-            except Exception: pass
-            res_body_path = scroll_dir / f"res_{base}.bin"
-            res_body_path.write_bytes(body)
-            res_size = len(body)
+                if GRAPHQL_RE.search(url):
+                    graphql_seen += 1
+                    try: body, is_json = resp.text(), True
+                    except Exception: body, is_json = resp.body(), False
+                    bbytes = body.encode("utf-8", errors="replace") if isinstance(body, str) else body
+                    friendly, doc_id = get_req_meta(resp)
+                    save_blob("graphql", current_scroll_idx, url, resp.status, bbytes, friendly, doc_id, is_json, is_search_serp(friendly), "GraphQL")
+                elif ROUTE_RE.search(url):
+                    route_seen += 1
+                    try: body, is_json = resp.text(), True
+                    except Exception: body, is_json = resp.body(), False
+                    bbytes = body.encode("utf-8", errors="replace") if isinstance(body, str) else body
+                    friendly, doc_id = get_req_meta(resp)
+                    save_blob("route", current_scroll_idx, url, resp.status, bbytes, friendly, doc_id, is_json, False, "Route")
+            except Exception as ex:
+                print(f"[resp-handler-error] {ex}")
 
-            # parse JSON regardless of content-type
-            parsed = try_parse_json(body)
-            is_json = parsed is not None
-            has_serp = False
-            json_hash = ""
-            res_json_path = ""
-            if is_json:
-                payloads = parsed if isinstance(parsed, list) else [parsed]
-                for pl in payloads:
-                    try:
-                        if pl.get("data", {}).get("serpResponse"):
-                            has_serp = True; break
-                    except Exception: pass
-                json_hash = short_sha1(body)
-                res_json = scroll_dir / f"res_{base}.json"
-                res_json.write_text(json.dumps(parsed, ensure_ascii=False, indent=2), encoding="utf-8")
-                res_json_path = str(res_json.relative_to(session_dir))
+        page.on("response", on_response)
 
-            mw.writerow([
-                cycle, scroll_idx, ts_iso(ts),
-                info["method"], info["resource_type"], status, ctype,
-                url, info["friendly_name"], info["doc_id"],
-                int(is_json), int(has_serp), json_hash,
-                str(req_path.relative_to(session_dir)),
-                str(res_body_path.relative_to(session_dir)),
-                res_json_path,
-                req_size, res_size
-            ])
-            mf.flush()
-
-        def on_request_finished(req):
+        def robust_goto(pg, url: str):
+            print(f"[i] Navigating → {url}")
             try:
-                resp = req.response()
-                if resp: save_event(req, resp, current_cycle, current_scroll_idx)
-            except Exception:
-                pass
+                pg.goto(url, wait_until="domcontentloaded", timeout=nav_timeout_ms)
+            except PWTimeout:
+                print("[!] Timeout on domcontentloaded; retrying 'load'…")
+                try: pg.goto(url, wait_until="load", timeout=nav_timeout_ms)
+                except PWTimeout: print("[!] Still timed out; proceeding anyway.")
+            cur = (pg.url or "").lower()
+            if cur.startswith("about:") or "chrome://" in cur or "edge://" in cur or "opera://" in cur:
+                print(f"[!] Still on '{pg.url}'. Opening a fresh tab and retrying…")
+                pg = context.new_page(); pg.on("response", on_response)
+                try: pg.goto(url, wait_until="domcontentloaded", timeout=nav_timeout_ms)
+                except Exception as e: print(f"[!] Retry navigation error: {e}")
+            return pg
 
-        page.on("requestfinished", on_request_finished)
+        page = robust_goto(page, args.link)
 
-        # -------- CAPTURE WITH TINY BUFFERS --------
-        for current_cycle in range(RELOAD_CYCLES):
-            current_scroll_idx = -1
-            if current_cycle == 0: page.goto(SEARCH_URL, wait_until="domcontentloaded")
-            else: page.reload(wait_until="domcontentloaded")
+        print(f"[i] Initial buffer: {args.initial-buffer-s if hasattr(args,'initial-buffer-s') else args.initial_buffer_s:.1f}s")  # guard
+        time.sleep(getattr(args, "initial_buffer_s", 10.0))
 
-            # minimal initial wait
-            if INITIAL_BUFFER_SEC: time.sleep(INITIAL_BUFFER_SEC)
-
-            # try switch to "Posts" tab (fast)
+        try: last_h = page.evaluate("() => document.body.scrollHeight")
+        except Exception: last_h = 0
+        current_scroll_idx = -1
+        for i in range(args.scrolls):
+            current_scroll_idx = i
             try:
-                click_posts_tab(page)
-            except Exception:
-                pass
+                page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                time.sleep(0.25)
+                new_h = page.evaluate("() => document.body.scrollHeight")
+            except Exception as e:
+                print(f"[!] Scroll eval error: {e}"); break
+            print(f"[i] scroll {i+1}/{args.scrolls} • height={new_h}")
+            time.sleep(args.per_scroll_s)
+            if new_h <= last_h:
+                print("[i] No more content; stopping."); break
+            last_h = new_h
 
-            last_h = 0
-            for si in range(MAX_SCROLLS):
-                current_scroll_idx = si
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                if PER_SCROLL_WAIT_SEC: time.sleep(PER_SCROLL_WAIT_SEC)
+        print("[i] Final idle: 5s"); time.sleep(5)
+        context.close()
 
-                # short quiet window
-                start_wait = time.time()
-                while True:
-                    now = time.time()
-                    if last_graphql_at == 0.0:
-                        if (now - start_wait) >= QUIET_SEC_AFTER_SCROLL: break
-                    else:
-                        if (now - last_graphql_at) >= QUIET_SEC_AFTER_SCROLL: break
-                    time.sleep(0.05)
-
-                new_h = page.evaluate("document.body.scrollHeight")
-                if new_h == last_h:
-                    break
-                last_h = new_h
-
-            if FINAL_IDLE_SEC: time.sleep(FINAL_IDLE_SEC)
-            if current_cycle < RELOAD_CYCLES-1 and WAIT_BETWEEN_RELOADS_SEC:
-                time.sleep(WAIT_BETWEEN_RELOADS_SEC)
-
-        browser.close()
-        mf.close()
-
-    # -------- PARSE → CSV (immediately after capture) --------
-    manifest = manifest_csv
-    out_csv = session_dir / "fb_extracted_texts.csv"
-
-    # read manifest, parse only JSON with serp
-    seen = set()
-    kept = 0
-    total_edges = 0
-
-    with manifest.open("r", encoding="utf-8") as f_in, out_csv.open("w", newline="", encoding="utf-8") as f_out:
-        rdr = csv.DictReader(f_in)
-        w = csv.writer(f_out)
-        w.writerow(["text","timestamp_utc","timestamp_manila","permalink","friendly_name","doc_id","cycle","scroll_idx","json_file"])
-        for row in rdr:
-            if row.get("is_json") != "1" or row.get("has_serp") != "1":
-                continue
-            json_rel = row.get("res_json_path") or ""
-            if not json_rel: continue
-            json_path = (session_dir / json_rel).resolve()
-            try:
-                parsed = json.loads(json_path.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-
-            payloads = parsed if isinstance(parsed, list) else [parsed]
-            for pl in payloads:
-                try:
-                    edges = pl["data"]["serpResponse"]["results"]["edges"]
-                except Exception:
-                    continue
-                if not isinstance(edges, list): continue
-                for e in edges:
-                    text, story_node = get_story_text_and_node(e)
-                    if not text or not story_node: continue
-                    if FILTER_KEYWORD and FILTER_KEYWORD.lower() not in text.lower():
-                        continue
-                    ts = find_creation_time(e, story_node)
-                    permalink = guess_permalink(story_node)
-                    total_edges += 1
-                    key = (text.strip(), int(ts) if ts is not None else -1)
-                    if key in seen: continue
-                    seen.add(key); kept += 1
-                    w.writerow([
-                        text.strip(),
-                        to_utc_iso(ts),
-                        to_manila_iso(ts),
-                        permalink,
-                        row.get("friendly_name",""),
-                        row.get("doc_id",""),
-                        row.get("cycle",""),
-                        row.get("scroll_idx",""),
-                        json_rel
-                    ])
-
-    print(f"\n[✓] Capture+Parse complete.")
-    print(f"Session dir: {session_dir.resolve()}")
-    print(f"Manifest:    {manifest.resolve()}")
-    print(f"Extracted:   {out_csv.resolve()}")
-    print(f"Edges seen:  {total_edges} • Rows written: {kept}")
+    print("\n=== DEBUG SUMMARY ===")
+    print(f"graphql_seen: {graphql_seen}")
+    print(f"route_seen:   {route_seen}")
+    print(f"graphql_saved:{graphql_saved}")
+    print(f"route_saved:  {route_saved}")
+    print(f"non_json:     {non_json}")
+    print(f"Session dir:  {session_dir.resolve()}")
+    print(f"Manifest:     {manifest_fp.resolve()}")
 
 if __name__ == "__main__":
     main()

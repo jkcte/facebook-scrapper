@@ -1,0 +1,4 @@
+﻿when_iso,cycle,scroll_idx,status,size_bytes,friendly_name,doc_id,is_json,is_serp,kind,file_path,url
+2025-09-18T01:44:30,0,0,200,40913,,,1,0,Route,debug_graphql_cap\session_1758131046768\cycle_00\route_1758131070094.json,https://www.facebook.com/ajax/bulk-route-definitions/
+2025-09-18T01:44:30,0,0,200,204,fetchMWChatVideoAutoplaySettingQuery,9713919638685405,1,0,GraphQL,debug_graphql_cap\session_1758131046768\cycle_00\graphql_1758131070208.json,https://www.facebook.com/api/graphql/
+2025-09-18T01:44:30,0,0,200,193042,,,1,0,Route,debug_graphql_cap\session_1758131046768\cycle_00\route_1758131070234.json,https://www.facebook.com/ajax/bulk-route-definitions/

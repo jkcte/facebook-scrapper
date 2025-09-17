@@ -23,6 +23,38 @@ text, timestamp_utc, timestamp_manila, permalink, friendly_name, doc_id, entry_i
 
 ---
 
+## One-shot orchestration (optional)
+
+If you prefer a single command to capture + parse in one go, use `runScript.py`.
+
+Current script interface (as of today):
+
+```
+python runScript.py <facebook_link> <output_csv> [--filter <keyword>]
+```
+
+Example:
+
+```
+python runScript.py "https://www.facebook.com/profile/100069113923869/search/?q=walang%20pasok" results.csv --filter "walang pasok"
+```
+
+Planned (upcoming) flags-based interface:
+
+```
+python runScript.py --link "<facebook_link>" --output results.csv [--filter "keyword"]
+```
+
+What it does:
+
+- Runs `facebookScrape.py` to collect the Facebook network (HAR and GraphQL/route JSONs)
+- Finds the generated HAR(s)
+- Invokes `har_extract_fb_serp.py` once to produce your consolidated CSV
+
+Note: On Windows PowerShell you can use either `python` or `py` depending on how Python is installed.
+
+---
+
 ## Requirements
 
 * **OS:** Windows
@@ -310,6 +342,19 @@ python har_extract_fb_serp.py "C:\path\to\generated.har" --out "manifest.csv"
 ```
 
 > You can still **manually export** a HAR with DevTools if you prefer.
+
+### End-to-end (current runScript interface)
+
+```
+# Single command: capture + parse
+python runScript.py "https://www.facebook.com/profile/100069113923869/search/?q=walang%20pasok" results.csv --filter "walang pasok"
+```
+
+Once the planned flags interface is released, the usage will become:
+
+```
+python runScript.py --link "https://www.facebook.com/profile/100069113923869/search/?q=walang%20pasok" --output results.csv --filter "walang pasok"
+```
 
 ---
 
