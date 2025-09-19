@@ -1,0 +1,1 @@
+{"data":{"screen_time_sync":{"aggs":{"__typename":"ScreenTimeSyncMutationOutput","today_s":2754,"l24h_s":2829}}},"extensions":{"server_metadata":{"request_start_time_ms":1758266593616,"time_at_flush_ms":1758266593761},"is_final":true}}

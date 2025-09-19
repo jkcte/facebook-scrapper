@@ -1,254 +1,147 @@
-# fb_debug_graphql_capture_v2.py
-# pip install playwright
-# playwright install
+#!/usr/bin/env python3
+# facebookScrape.py — capture FB network using temporary Playwright profile (Option 2)
+from __future__ import annotations
 
-import csv, json, time, hashlib, re
+import argparse, csv, os, re, sys, time, shutil
+from datetime import datetime
 from pathlib import Path
-from datetime import datetime, timezone
-from urllib.parse import parse_qs
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-SEARCH_URL = "https://www.facebook.com/profile/100069113923869/search/?q=walang%20pasok"
+GRAPHQL_RE = re.compile(r"https://www\.facebook\.com/api/graphql/", re.I)
+ROUTE_RE   = re.compile(r"/ajax/bulk-route-definitions", re.I)
 
-HEADLESS               = False
-INITIAL_BUFFER_SEC     = 10
-PER_SCROLL_WAIT_SEC    = 5
-QUIET_SEC_AFTER_SCROLL = 2.5
-FINAL_IDLE_SEC         = 5
-MAX_SCROLLS            = 20
-RELOAD_CYCLES          = 1
-WAIT_BETWEEN_RELOADS_SEC = 3
+def now_ms() -> int: return int(time.time()*1000)
+def ensure_dir(p: Path) -> Path: p.mkdir(parents=True, exist_ok=True); return p
 
-OUT_ROOT     = Path("debug_graphql_cap_v2")
-COOKIES_PATH = Path("fb_cookies.json")
-
-FB_GRAPHQL_MATCH = ("/api/graphql", "/api/graphqlbatch")
-FB_HOST_HINTS    = (".facebook.com",)
-
-# Try to click the "Posts" tab on the profile search page (multi-locale)
-TAB_LABELS = [
-    r"^Posts$", r"^Mga Post$", r"^Mga\s*Mga\s*Post$", r"^Public Posts$", r"^Mga Pampublikong Post$"
-]
-
-def ts_iso(ts=None): return datetime.fromtimestamp(ts or time.time(), tz=timezone.utc).isoformat()
-def ensure_dir(p: Path): p.mkdir(parents=True, exist_ok=True)
-
-def save_cookies(ctx, path=COOKIES_PATH):
-    path.write_text(json.dumps(ctx.cookies(), ensure_ascii=False, indent=2), encoding="utf-8")
-def load_cookies(ctx, path=COOKIES_PATH):
-    if path.exists():
-        ctx.add_cookies(json.loads(path.read_text(encoding="utf-8"))); return True
-    return False
-
-def is_fb_graphql(url: str) -> bool:
-    return any(h in url for h in FB_HOST_HINTS) and any(s in url for s in FB_GRAPHQL_MATCH)
-
-def short_sha1(b: bytes) -> str:
-    return hashlib.sha1(b).hexdigest()[:12]
-
-def parse_graphql_request(req):
-    info = {
-        "method": req.method,
-        "url": req.url,
-        "headers": dict(req.headers),
-        "resource_type": req.resource_type,
-        "doc_id": None,
-        "friendly_name": None,
-        "variables": None,
-        "raw_post_data": None,
-    }
-    # header-based friendly name (seen in your capture)
-    fn = info["headers"].get("x-fb-friendly-name") or info["headers"].get("x-fb-friendly-name".lower())
-    if fn: info["friendly_name"] = fn
-
-    try:
-        pd = req.post_data() or ""
-        info["raw_post_data"] = pd
-        if pd:
-            form = parse_qs(pd)
-            info["doc_id"] = form.get("doc_id", [None])[0]
-            friendly = form.get("fb_api_req_friendly_name", [None])[0]
-            info["friendly_name"] = info["friendly_name"] or friendly
-            variables = form.get("variables", [None])[0]
-            if variables:
-                try: info["variables"] = json.loads(variables)
-                except Exception: info["variables"] = variables
-    except Exception:
-        pass
-    return info
-
-def try_parse_json(body: bytes):
-    if not body: return None
-    s = body.decode("utf-8", errors="replace").lstrip()
-    # Strip anti-JSON-hijack prefix if present
-    if s.startswith("for (;;);"):
-        s = s[10:].lstrip()
-    try:
-        return json.loads(s)
-    except Exception:
-        return None
-
-def click_posts_tab(page):
-    # Try common roles/selectors; ignore errors
-    for pat in TAB_LABELS:
+def wait_for_file(path: Path, timeout_s: float = 5.0) -> bool:
+    deadline = time.time() + max(0.0, timeout_s)
+    while time.time() < deadline:
         try:
-            # role=link or role=tab with text matching
-            page.get_by_role("link", name=re.compile(pat, re.I)).first.click(timeout=1500)
-            return True
-        except PWTimeout:
-            pass
+            if path.exists() and path.stat().st_size > 0:
+                return True
         except Exception:
             pass
-        try:
-            page.get_by_role("tab", name=re.compile(pat, re.I)).first.click(timeout=1500)
-            return True
-        except PWTimeout:
-            pass
-        except Exception:
-            pass
-    return False
+        time.sleep(0.1)
+    return path.exists() and path.stat().st_size > 0
 
 def main():
-    session_dir = OUT_ROOT / f"session_{int(time.time())}"
-    ensure_dir(session_dir)
-    manifest_csv = session_dir / "manifest.csv"
-    mf = manifest_csv.open("w", newline="", encoding="utf-8")
-    mw = csv.writer(mf)
-    mw.writerow([
-        "cycle","scroll_idx","ts_iso",
-        "req_method","req_res_type","status","content_type",
-        "url","friendly_name","doc_id",
-        "is_json","has_serp","json_hash",
-        "req_json_path","res_body_path","res_json_path",
-        "req_size","res_size"
-    ])
+    ap = argparse.ArgumentParser(description="Capture FB GraphQL/Route + HAR with temp profile (Option 2).")
+    ap.add_argument("--link", required=True, help="Facebook URL to open.")
+    ap.add_argument("--har-export", default=None, help="Optional: copy HAR after capture.")
+    ap.add_argument("--har-wait-s", type=float, default=5.0)
+    ap.add_argument("--scrolls", type=int, default=20)
+    ap.add_argument("--initial-buffer-s", type=float, default=10.0)
+    ap.add_argument("--per-scroll-s", type=float, default=5.0)
+    ap.add_argument("--nav-timeout-s", type=float, default=60.0)
+    ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--session-root", default="debug_graphql_cap")
+    ap.add_argument("--har-filename", default="network.har")
+    ap.add_argument("--no-har", action="store_true")
+    args = ap.parse_args()
+
+    # Temporary Playwright profile path
+    user_data_root = Path(r"C:\Users\Owner\Documents\GitHub\facebook-scrapper\pw_profile")
+    chrome_exe = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+
+    print(f"[!] Close all Chrome instances before running.")
+    print(f"[i] Using temporary profile: {user_data_root}")
+
+    # Session directories
+    ts = now_ms()
+    session_dir = ensure_dir(Path(args.session_root)/f"session_{ts}")
+    cycle_dir   = ensure_dir(session_dir/"cycle_00")
+    manifest_fp = session_dir/"manifest.csv"
+    har_path    = session_dir/args.har_filename
+    print(f"[i] Session dir: {session_dir.resolve()}")
+    print(f"[i] HAR: {'disabled' if args.no_har else har_path.resolve()}")
+
+    with manifest_fp.open("w", newline="", encoding="utf-8-sig") as f:
+        csv.writer(f).writerow([
+            "when_iso","cycle","scroll_idx","status","size_bytes","friendly_name","doc_id",
+            "is_json","is_serp","kind","file_path","url"
+        ])
+
+    graphql_seen=route_seen=graphql_saved=route_saved=non_json=0
+    current_scroll_idx = -1
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS)
-        ctx = browser.new_context()
-        page = ctx.new_page()
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=str(user_data_root),
+            executable_path=chrome_exe,
+            channel="chrome",
+            headless=args.headless,
+            record_har_path=str(har_path) if not args.no_har else None,
+            record_har_mode="full"
+        )
 
-        if not load_cookies(ctx):
-            page.goto("https://www.facebook.com/login.php", wait_until="domcontentloaded")
-            print("Log in, then press Enter here…"); input(); save_cookies(ctx)
+        try: context.grant_permissions(["notifications"], origin="https://www.facebook.com")
+        except Exception: pass
 
-        last_graphql_at = 0.0
+        page = context.pages[0] if context.pages else context.new_page()
 
-        def save_event(req, resp, cycle, scroll_idx):
-            nonlocal last_graphql_at
-            url = req.url
-            if not is_fb_graphql(url): return
-            ts = time.time(); last_graphql_at = ts
-            info = parse_graphql_request(req)
+        # --- Response handler ---
+        def save_blob(prefix, scroll_idx, url, status, body_bytes, kind):
+            nonlocal graphql_saved, route_saved, non_json
+            out_path = cycle_dir / f"{prefix}_{now_ms()}.json"
+            out_path.write_bytes(body_bytes)
+            if kind=="GraphQL": graphql_saved += 1
+            else: route_saved += 1
+            csv.writer(manifest_fp.open("a", newline="", encoding="utf-8-sig")).writerow(
+                [datetime.now().isoformat(timespec="seconds"),0,scroll_idx,status,len(body_bytes),
+                 "", "", 1, 1 if prefix=="graphql" else 0, kind, str(out_path), url]
+            )
 
-            # Files
-            cycle_dir = session_dir / f"cycle_{cycle:02d}"
-            scroll_dir = cycle_dir / f"scroll_{scroll_idx:03d}"
-            ensure_dir(scroll_dir)
-            base = f"{int(ts*1000)}"
+        page.on("response", lambda resp: save_blob(
+            "graphql" if GRAPHQL_RE.search(resp.url) else "route" if ROUTE_RE.search(resp.url) else "other",
+            current_scroll_idx,
+            resp.url,
+            resp.status,
+            resp.body() if not resp.body() is None else b"",
+            "GraphQL" if GRAPHQL_RE.search(resp.url) else "Route"
+        ))
 
-            # Request meta
-            req_path = scroll_dir / f"req_{base}.json"
-            req_path.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
-            req_size = len(info.get("raw_post_data") or "")
+        # --- Navigate ---
+        print(f"[i] Navigating to {args.link}")
+        page.goto(args.link, wait_until="domcontentloaded", timeout=int(args.nav_timeout_s*1000))
 
-            # Response raw
-            status = None; ctype = ""; body = b""
-            try:
-                status = resp.status
-                ctype = resp.headers.get("content-type", "")
-                body = resp.body() or b""
-            except Exception: pass
-            res_body_path = scroll_dir / f"res_{base}.bin"
-            res_body_path.write_bytes(body)
-            res_size = len(body)
+        print(f"[i] Initial buffer: {args.initial_buffer_s}s")
+        time.sleep(args.initial_buffer_s)
 
-            # Try JSON parse regardless of content-type
-            parsed = try_parse_json(body)
-            is_json = parsed is not None
-            has_serp = False
-            json_hash = ""
-            res_json_path = ""
-            if is_json:
-                # GraphQL may be list or dict (batch vs single)
-                payloads = parsed if isinstance(parsed, list) else [parsed]
-                for pl in payloads:
-                    try:
-                        if pl.get("data", {}).get("serpResponse"): has_serp = True; break
-                    except Exception: pass
-                json_hash = short_sha1(body)
-                res_json_path = scroll_dir / f"res_{base}.json"
-                res_json_path.write_text(json.dumps(parsed, ensure_ascii=False, indent=2), encoding="utf-8")
-                res_json_path = str(res_json_path.relative_to(session_dir))
+        # --- Scroll ---
+        try: last_h = page.evaluate("() => document.body.scrollHeight")
+        except Exception: last_h = 0
+
+        for i in range(args.scrolls):
+            current_scroll_idx = i
+            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            time.sleep(args.per_scroll_s)
+            try: new_h = page.evaluate("() => document.body.scrollHeight")
+            except Exception: new_h = last_h
+            print(f"[i] scroll {i+1}/{args.scrolls} • height={new_h}")
+            if new_h <= last_h: print("[i] No more content; stopping."); break
+            last_h = new_h
+
+        print("[i] Final idle: 5s")
+        time.sleep(5)
+        context.close()
+
+        # --- HAR export ---
+        if not args.no_har:
+            if wait_for_file(har_path, timeout_s=args.har_wait_s):
+                if args.har_export:
+                    shutil.copy2(har_path, Path(args.har_export))
+                    print(f"[✓] HAR exported to: {Path(args.har_export).resolve()}")
+                else:
+                    print(f"[✓] HAR saved at: {har_path.resolve()}")
             else:
-                res_json_path = ""
+                print("[!] HAR not found or empty.")
 
-            mw.writerow([
-                cycle, scroll_idx, ts_iso(ts),
-                info["method"], info["resource_type"], status, ctype,
-                url, info["friendly_name"], info["doc_id"],
-                int(is_json), int(has_serp), json_hash,
-                str(req_path.relative_to(session_dir)),
-                str(res_body_path.relative_to(session_dir)),
-                res_json_path,
-                req_size, res_size
-            ])
-            mf.flush()
-
-            tag = f"{info['friendly_name'] or ''}".strip()
-            print(f"[✓] GraphQL saved • cyc {cycle} • scr {scroll_idx} • {status} • "
-                  f"{res_size}B • fn={tag or '-'} • json={is_json} • serp={has_serp}")
-
-        def on_request_finished(req):
-            try:
-                resp = req.response()
-                if resp: save_event(req, resp, current_cycle, current_scroll_idx)
-            except Exception as e:
-                print(f"[warn] requestfinished error: {e}")
-
-        page.on("requestfinished", on_request_finished)
-
-        for current_cycle in range(RELOAD_CYCLES):
-            current_scroll_idx = -1
-            if current_cycle == 0: page.goto(SEARCH_URL, wait_until="domcontentloaded")
-            else: page.reload(wait_until="domcontentloaded")
-
-            if INITIAL_BUFFER_SEC: time.sleep(INITIAL_BUFFER_SEC)
-
-            # Try to switch to Posts tab to trigger serpResponse
-            try:
-                switched = click_posts_tab(page)
-                if switched: time.sleep(2.0)
-            except Exception: pass
-
-            last_h = 0
-            for si in range(MAX_SCROLLS):
-                current_scroll_idx = si
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                time.sleep(PER_SCROLL_WAIT_SEC)
-
-                # quiet window
-                start_wait = time.time()
-                while True:
-                    now = time.time()
-                    if last_graphql_at == 0.0:
-                        if (now - start_wait) >= QUIET_SEC_AFTER_SCROLL: break
-                    else:
-                        if (now - last_graphql_at) >= QUIET_SEC_AFTER_SCROLL: break
-                    time.sleep(0.25)
-
-                new_h = page.evaluate("document.body.scrollHeight")
-                print(f"[i] cycle {current_cycle} • scroll {si+1}/{MAX_SCROLLS} • height={new_h}")
-                if new_h == last_h:
-                    print("[i] No more content; stopping scroll."); break
-                last_h = new_h
-
-            if FINAL_IDLE_SEC: time.sleep(FINAL_IDLE_SEC)
-            if current_cycle < RELOAD_CYCLES-1 and WAIT_BETWEEN_RELOADS_SEC:
-                time.sleep(WAIT_BETWEEN_RELOADS_SEC)
-
-        browser.close(); mf.close()
-        print(f"\n[✓] Capture complete.\nSession: {session_dir.resolve()}\nManifest: {manifest_csv.resolve()}")
+    # --- Debug summary ---
+    print("\n=== DEBUG SUMMARY ===")
+    print(f"Session dir:   {session_dir.resolve()}")
+    print(f"Manifest:      {manifest_fp.resolve()}")
+    print(f"GraphQL saved: {graphql_saved}")
+    print(f"Route saved:   {route_saved}")
 
 if __name__ == "__main__":
     main()
